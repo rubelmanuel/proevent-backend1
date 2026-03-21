@@ -270,13 +270,53 @@ app.get('/recintos', (req, res) => {
 });
 
 // CREAR evento
-app.post('/eventos', (req, res) => {
+app.post('/eventos', async (req, res) => {
   const {
     nombre, modalidad, fecha_inicio, fecha_fin, hora_inicio, hora_fin,
     cantidad_asistentes, tipo_evento, monto_poa, moneda,
     id_usuario, id_dependencia, id_recinto,
     detalles_corporativos, alimentos, observaciones
   } = req.body;
+
+  let tasa_cambio = 1;
+  let monto_dop = 0;
+  
+  const montoPOA = parseFloat(monto_poa) || 0;
+
+  if (montoPOA > 0) {
+    if (moneda && moneda !== 'DOP') {
+      try {
+        const fetchRes = await fetch(`https://open.er-api.com/v6/latest/${moneda}`);
+        const data = await fetchRes.json();
+        tasa_cambio = data.rates.DOP || 1;
+      } catch (err) {
+        console.error("Error al obtener tasa de cambio:", err);
+      }
+    }
+    monto_dop = montoPOA * tasa_cambio;
+  }
+
+  // Comprobar si hay un POA activo para deducir
+  let id_poa_activo = null;
+  if (montoPOA > 0) {
+    try {
+      const dbPromise = db.promise();
+      const [poas] = await dbPromise.query(
+        "SELECT id_poa, monto_disponible FROM poa_fiscal WHERE fecha_inicio <= ? AND fecha_fin >= ? ORDER BY id_poa DESC LIMIT 1",
+        [fecha_inicio, fecha_inicio]
+      );
+      if (poas.length > 0) {
+        id_poa_activo = poas[0].id_poa;
+        if (parseFloat(poas[0].monto_disponible) < monto_dop) {
+          return res.status(400).json({ mensaje: 'Presupuesto POA insuficiente para este monto en la fecha del evento.' });
+        }
+      } else {
+        return res.status(400).json({ mensaje: 'No hay un año fiscal registrado que coincida con la fecha del evento para asignar POA.' });
+      }
+    } catch (err) {
+      return res.status(500).json({ mensaje: 'Error verificando POA', error: err.message });
+    }
+  }
 
   db.query(
     `INSERT INTO evento (nombre, modalidad, fecha_inicio, fecha_fin, hora_inicio, hora_fin,
@@ -289,13 +329,11 @@ app.post('/eventos', (req, res) => {
 
       const id_evento = result.insertId;
 
-      // Guardar detalles corporativos
       if (detalles_corporativos && detalles_corporativos.length > 0) {
         const valoresCorp = detalles_corporativos.map(tipo => [id_evento, tipo]);
         db.query('INSERT INTO detalle_corporativo (id_evento, tipo) VALUES ?', [valoresCorp], () => { });
       }
 
-      // Guardar alimentos
       if (alimentos && alimentos.length > 0) {
         db.query('SELECT id_alimento, nombre FROM alimento', (err2, alimentosDB) => {
           if (!err2) {
@@ -311,16 +349,94 @@ app.post('/eventos', (req, res) => {
         });
       }
 
-      // Guardar observaciones como detalle de montaje
       if (observaciones && observaciones.trim() !== '') {
         db.query('INSERT INTO detalle_montaje (id_evento, descripcion) VALUES (?, ?)', [id_evento, observaciones], () => { });
       }
 
+      if (montoPOA > 0 && id_poa_activo) {
+        db.query(
+          `INSERT INTO poa_movimiento (id_poa, id_evento, monto_solicitado_original, moneda_original, tasa_cambio, monto_descontado_dop, estado)
+           VALUES (?, ?, ?, ?, ?, ?, 'Pendiente')`,
+          [id_poa_activo, id_evento, montoPOA, moneda || 'DOP', tasa_cambio, monto_dop],
+          (poaErr) => {
+            if (!poaErr) {
+               db.query("UPDATE poa_fiscal SET monto_disponible = monto_disponible - ? WHERE id_poa = ?", [monto_dop, id_poa_activo], ()=>{});
+            }
+          }
+        );
+      }
+
       res.status(201).json({ mensaje: 'Evento creado con éxito', id_evento });
       const reqUserId = req.headers['x-usuario-id'] || id_usuario;
-      if(reqUserId) registrarMovimiento(reqUserId, null, 'CREACION_EVENTO', `Nueva Solicitud de Evento. ID generado: ${id_evento}. Título: "${nombre}". Modalidad: ${modalidad}. Cantidad de Asistentes: ${cantidad_asistentes}. Creado para dependencia ID: ${id_dependencia}.`);
+      if(reqUserId) registrarMovimiento(reqUserId, null, 'CREACION_EVENTO', `Nueva Solicitud de Evento. ID generado: ${id_evento}. Título: "${nombre}".`);
     }
   );
+});
+
+// ── PLAN OPERATIVO ANUAL (POA) ─────────────────────────
+app.post('/poa', (req, res) => {
+  const { fecha_inicio, fecha_fin, monto_total } = req.body;
+  if (!fecha_inicio || !fecha_fin || !monto_total) return res.status(400).json({ mensaje: 'Datos incompletos.' });
+
+  const reqUserId = req.headers['x-usuario-id'] || null;
+
+  db.query(
+    'INSERT INTO poa_fiscal (fecha_inicio, fecha_fin, monto_total, monto_disponible, creado_por) VALUES (?, ?, ?, ?, ?)',
+    [fecha_inicio, fecha_fin, monto_total, monto_total, reqUserId],
+    (err, result) => {
+      if (err) return res.status(500).json({ error: err.message });
+      res.status(201).json({ mensaje: 'POA Creado', id_poa: result.insertId });
+      if(reqUserId) registrarMovimiento(reqUserId, null, 'CREACION_POA', `Nuevo presupuesto POA por ${monto_total}.`);
+    }
+  );
+});
+
+app.get('/poa', (req, res) => {
+  db.query('SELECT * FROM poa_fiscal ORDER BY fecha_inicio DESC', (err, poas) => {
+    if (err) return res.status(500).json({ error: err.message });
+    
+    db.query(`
+      SELECT m.*, e.nombre as nombre_evento, u.nombre as solicitante
+      FROM poa_movimiento m
+      JOIN evento e ON m.id_evento = e.id_evento
+      LEFT JOIN usuario u ON e.id_usuario = u.id_usuario
+      ORDER BY m.fecha_movimiento DESC
+    `, (errMov, movs) => {
+      if (errMov) return res.status(500).json({ error: errMov.message });
+      res.json({ poas, movimientos: movs });
+    });
+  });
+});
+
+app.put('/poa/movimiento/:id/estado', (req, res) => {
+  const { id } = req.params;
+  const { estado, motivo_rechazo } = req.body; 
+  const reqUserId = req.headers['x-usuario-id'];
+
+  db.query('SELECT * FROM poa_movimiento WHERE id_movimiento = ?', [id], (err, results) => {
+    if (err || results.length === 0) return res.status(404).json({ mensaje: 'Movimiento no encontrado' });
+    
+    const mov = results[0];
+    if (mov.estado === estado) return res.json({ mensaje: 'Sin cambios en el estado' });
+
+    db.query('UPDATE poa_movimiento SET estado = ?, motivo_rechazo = ? WHERE id_movimiento = ?', 
+      [estado, motivo_rechazo || null, id], 
+      (errUpdate) => {
+        if (errUpdate) return res.status(500).json({ error: errUpdate.message });
+        
+        // Si el estado anterior no era Rechazado y ahora es Rechazado, devolver dinero.
+        if (estado === 'Rechazado' && mov.estado !== 'Rechazado') {
+          db.query('UPDATE poa_fiscal SET monto_disponible = monto_disponible + ? WHERE id_poa = ?', [mov.monto_descontado_dop, mov.id_poa]);
+        }
+        // Si el estado anterior era Rechazado y ahora es Aprobado/Pendiente, volver a restar dinero.
+        else if (mov.estado === 'Rechazado' && estado !== 'Rechazado') {
+          db.query('UPDATE poa_fiscal SET monto_disponible = monto_disponible - ? WHERE id_poa = ?', [mov.monto_descontado_dop, mov.id_poa]);
+        }
+
+        res.json({ mensaje: 'Estado del movimiento POA actualizado' });
+        if(reqUserId) registrarMovimiento(reqUserId, null, 'ACTUALIZACION_POA', `Movimiento ${id} cambiado a ${estado}.`);
+    });
+  });
 });
 // ── EVENTOS — OBTENER TODOS ────────────────────────────
 app.get('/eventos', (req, res) => {
