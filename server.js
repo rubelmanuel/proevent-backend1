@@ -396,10 +396,13 @@ app.get('/poa', (req, res) => {
     if (err) return res.status(500).json({ error: err.message });
     
     db.query(`
-      SELECT m.*, e.nombre as nombre_evento, u.nombre as solicitante
+      SELECT m.*, e.nombre as nombre_evento, e.modalidad, e.fecha_inicio, e.fecha_fin,
+             e.hora_inicio, e.hora_fin, e.cantidad_asistentes, e.tipo_evento,
+             u.nombre as solicitante, r.nombre as recinto
       FROM poa_movimiento m
       JOIN evento e ON m.id_evento = e.id_evento
       LEFT JOIN usuario u ON e.id_usuario = u.id_usuario
+      LEFT JOIN recinto r ON e.id_recinto = r.id_recinto
       ORDER BY m.fecha_movimiento DESC
     `, (errMov, movs) => {
       if (errMov) return res.status(500).json({ error: errMov.message });
@@ -438,6 +441,69 @@ app.put('/poa/movimiento/:id/estado', (req, res) => {
     });
   });
 });
+app.put('/eventos/:id', (req, res) => {
+  const { id } = req.params;
+  const { nombre, modalidad, fecha_inicio, fecha_fin, hora_inicio, hora_fin, cantidad_asistentes, tipo_evento, id_recinto, id_dependencia, detalles_corporativos, alimentos, observaciones, monto_poa, moneda } = req.body;
+  const reqUserId = req.headers['x-usuario-id'];
+
+  const sql = `UPDATE evento SET 
+    nombre = ?, modalidad = ?, fecha_inicio = ?, fecha_fin = ?, 
+    hora_inicio = ?, hora_fin = ?, cantidad_asistentes = ?, 
+    tipo_evento = ?, id_recinto = ?, id_dependencia = ?,
+    monto_poa = ?, moneda = ?
+    WHERE id_evento = ?`;
+  
+  if (!id_recinto || !id_dependencia) {
+    return res.status(400).json({ mensaje: 'Faltan campos obligatorios: Recinto o Dependencia.' });
+  }
+
+  const params = [nombre, modalidad, fecha_inicio, fecha_fin, hora_inicio, hora_fin, cantidad_asistentes, tipo_evento, id_recinto, id_dependencia, monto_poa, moneda, id];
+
+  db.query(sql, params, (err) => {
+    if (err) {
+      console.error('SQL Error en PUT /eventos:', err.message);
+      console.error('Params:', params);
+      return res.status(500).json({ mensaje: 'Error al actualizar evento', error: err.message });
+    }
+    
+    // Actualizar Detalle Corporativo
+    db.query('DELETE FROM detalle_corporativo WHERE id_evento = ?', [id], () => {
+      if (detalles_corporativos && detalles_corporativos.length > 0) {
+        const valoresCorp = detalles_corporativos.map(tipo => [id, tipo]);
+        db.query('INSERT INTO detalle_corporativo (id_evento, tipo) VALUES ?', [valoresCorp], () => { });
+      }
+    });
+
+    // Actualizar Alimentos
+    db.query('DELETE FROM evento_alimento WHERE id_evento = ?', [id], () => {
+      if (alimentos && alimentos.length > 0) {
+        db.query('SELECT id_alimento, nombre FROM alimento', (err2, alimentosDB) => {
+          if (!err2) {
+            const valores = [];
+            alimentos.forEach(nombreAlimento => {
+              const encontrado = alimentosDB.find(a => a.nombre === nombreAlimento);
+              if (encontrado) valores.push([id, encontrado.id_alimento]);
+            });
+            if (valores.length > 0) {
+              db.query('INSERT INTO evento_alimento (id_evento, id_alimento) VALUES ?', [valores], () => { });
+            }
+          }
+        });
+      }
+    });
+
+    // Actualizar Observaciones (Detalle Montaje)
+    db.query('DELETE FROM detalle_montaje WHERE id_evento = ?', [id], () => {
+      if (observaciones && observaciones.trim() !== '') {
+        db.query('INSERT INTO detalle_montaje (id_evento, descripcion) VALUES (?, ?)', [id, observaciones], () => { });
+      }
+    });
+    
+    res.json({ mensaje: 'Evento actualizado correctamente' });
+    if(reqUserId) registrarMovimiento(reqUserId, null, 'EDICION_EVENTO', `Evento ${id} actualizado.`);
+  });
+});
+
 // ── EVENTOS — OBTENER TODOS ────────────────────────────
 app.get('/eventos', (req, res) => {
   const { usuario_id } = req.query;
@@ -445,6 +511,8 @@ app.get('/eventos', (req, res) => {
        e.id_evento, e.nombre, e.modalidad, e.fecha_inicio, e.fecha_fin,
        e.hora_inicio, e.hora_fin, e.cantidad_asistentes, e.tipo_evento,
        e.monto_poa, e.moneda, e.estado, e.fecha_creacion,
+       e.id_recinto, e.id_dependencia,
+       pm.estado AS estado_poa,
        u.nombre  AS solicitante,
        u.id_usuario,
        d.nombre  AS dependencia,
@@ -455,6 +523,7 @@ app.get('/eventos', (req, res) => {
        IF((SELECT COUNT(*) FROM servicio_audiovisual sa WHERE sa.id_evento = e.id_evento) > 0, 1, 0) AS necesita_audiovisual,
        (SELECT GROUP_CONCAT(CONCAT(sa.cantidad, 'x ', sa.tipo_servicio) SEPARATOR ', ') FROM servicio_audiovisual sa WHERE sa.id_evento = e.id_evento AND sa.estado != 'Rechazado') AS equipos_audiovisuales
      FROM evento e
+     LEFT JOIN poa_movimiento pm ON e.id_evento = pm.id_evento
      LEFT JOIN usuario     u ON e.id_usuario     = u.id_usuario
      LEFT JOIN dependencia d ON e.id_dependencia = d.id_dependencia
      LEFT JOIN recinto     r ON e.id_recinto     = r.id_recinto`;
