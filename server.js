@@ -86,6 +86,56 @@ function registrarMovimiento(id_usuario, id_rol, accion, detalles = '') {
   }
 }
 
+// ── AUTO-FINALIZACIÓN DE EVENTOS ─────────────────────────
+// Revisa cada hora si algún evento con estado 'Aprobado'
+// ya pasó su fecha_fin y lo marca automáticamente como 'Finalizado'
+function autoFinalizarEventos() {
+  const hoy = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+
+  const sql = `
+    SELECT id_evento, nombre, id_usuario
+    FROM evento
+    WHERE estado = 'Aprobado'
+      AND DATE(fecha_fin) < ?
+  `;
+
+  db.query(sql, [hoy], (err, eventos) => {
+    if (err) {
+      console.error('❌ Error en auto-finalización:', err.message);
+      return;
+    }
+    if (eventos.length === 0) return;
+
+    const ids = eventos.map(e => e.id_evento);
+    db.query(
+      `UPDATE evento SET estado = 'Finalizado' WHERE id_evento IN (?)`,
+      [ids],
+      (errUpd) => {
+        if (errUpd) {
+          console.error('❌ Error al finalizar eventos:', errUpd.message);
+          return;
+        }
+        console.log(`✅ Auto-finalizados ${eventos.length} evento(s): IDs [${ids.join(', ')}]`);
+        // Registrar en bitácora por cada evento finalizado
+        eventos.forEach(e => {
+          if (e.id_usuario) {
+            registrarMovimiento(
+              e.id_usuario,
+              null,
+              'AUTO_FINALIZACION_EVENTO',
+              `El evento "${e.nombre}" (ID: ${e.id_evento}) fue finalizado automáticamente al superar su fecha de fin.`
+            );
+          }
+        });
+      }
+    );
+  });
+}
+
+// Ejecutar inmediatamente al iniciar y luego cada hora
+autoFinalizarEventos();
+setInterval(autoFinalizarEventos, 60 * 60 * 1000); // cada 60 minutos
+
 // LOGIN
 app.post('/login', (req, res) => {
   const { correo, contrasena } = req.body;
