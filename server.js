@@ -1,5 +1,9 @@
 // --- IMPORTACIONES PRINCIPALES ---
-const express = require('express'); // Framework web minimalista para crear el servidor HTTP en Node.js
+const express = require('express');
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
+const rateLimit = require('express-rate-limit');
+const helmet = require('helmet'); // Framework web minimalista para crear el servidor HTTP en Node.js
 const mysql = require('mysql2'); // Driver para establecer y manejar conexiones con la base de datos MySQL
 const cors = require('cors'); // Middleware que habilita CORS permitiendo que el Frontend (React) haga peticiones al Backend
 const crypto = require('crypto'); // Módulo de criptografía nativo de Node (usado para generar tokens de contraseña)
@@ -13,8 +17,17 @@ const googleClient = new OAuth2Client(GOOGLE_CLIENT_ID); // Inicializa el client
 
 // --- CONFIGURACIÓN DEL SERVIDOR EXPRESS ---
 const app = express(); // Instancia un nuevo servidor Express
-app.use(cors()); // Se añade el middleware global CORS a todas las rutas
-app.use(express.json()); // Middleware global que parsea cualquier body JSON recibido en las peticiones entrantes
+app.use(helmet()); // Seguridad HTTP
+app.use(cors({ origin: 'http://localhost:3000' })); // Restringir CORS al frontend local // Se añade el middleware global CORS a todas las rutas
+app.use(express.json());
+
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutos
+  max: 150, // Limitar a 150 peticiones por ventana
+  message: { mensaje: 'Demasiadas peticiones, intente más tarde' }
+});
+app.use(limiter);
+ // Middleware global que parsea cualquier body JSON recibido en las peticiones entrantes
 
 // --- CONFIGURACIÓN DE LA BASE DE DATOS MÚLTIPLES-CONEXIONES (POOL) ---
 const db = mysql.createPool({ // El Pool mantiene las conexiones vivas y las reutiliza en lugar de crear nuevas cada vez
@@ -42,9 +55,10 @@ db.getConnection((err, connection) => {
   const createTokensTable = `
     CREATE TABLE IF NOT EXISTS restablecimiento_token ( -- Crea tabla solo si el esquema no la contiene
       id_token INT AUTO_INCREMENT PRIMARY KEY, -- Clave primaria que se numera sola por registro
-      correo VARCHAR(120) NOT NULL, -- Columna string obligatoria para asociar el email al token
+      id_usuario INT NOT NULL, -- Columna INT obligatoria para asociar el usuario al token
       token VARCHAR(255) NOT NULL, -- Columna string para guardar el hash encriptado
-      expiracion DATETIME NOT NULL -- Marca de tiempo estricta para caducar el pin/token de seguridad
+      expiracion DATETIME NOT NULL, -- Marca de tiempo estricta para caducar el pin/token de seguridad
+      FOREIGN KEY (id_usuario) REFERENCES usuario(id_usuario) ON DELETE CASCADE
     )
   `;
   // Interacción directa para ejecutar la creación preventiva de la tabla temporal de tokens
@@ -155,26 +169,62 @@ autoFinalizarEventos(); // Efectúa una auto-revisión instintivamente una sola 
 setInterval(autoFinalizarEventos, 60 * 60 * 1000); // Dispara sub-rutina permanente a repetirse circular iterativamente eternamente con un plazo intermedio de 1 hora o 3600 segundos calculados matemáticamente
 
 
+
+// --- MIDDLEWARE DE AUTENTICACIÓN JWT ---
+const rutasPublicas = ['/login', '/login-google', '/restablecer-contrasena', '/validar-token'];
+const verificarToken = (req, res, next) => {
+  if (req.method === 'OPTIONS') return next(); // Preflight CORS
+  if (rutasPublicas.some(r => req.path.startsWith(r))) return next();
+  
+  const authHeader = req.headers['authorization'];
+  if (!authHeader) return res.status(403).json({ mensaje: 'No hay token provisto. Acceso denegado.' });
+  
+  const token = authHeader.split(' ')[1];
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'super_secreto_proevent_123');
+    req.usuario_sesion = decoded; // Guardar datos para usar en los endpoints si se necesita
+    next();
+  } catch (err) {
+    return res.status(401).json({ mensaje: 'Token inválido o expirado. Vuelva a iniciar sesión.' });
+  }
+};
+app.use(verificarToken);
+
 // --- RUTAS DE AUTENTICACIÓN ---
 // INICIO DE SESIÓN TRADICIONAL (Email y Contraseña)
 app.post('/login', (req, res) => { // Define el endpoint HTTP POST para procesar credenciales nativas bajo la ruta '/login'
   const { correo, contrasena } = req.body; // Extrae descriptivamente (Desestructuración) los campos 'correo' y 'contrasena' del cuerpo JSON enviado por el cliente
   // Prepara la consulta para buscar en la base de datos si existe el usuario con ambos campos coincidentes
   db.query(
-    `SELECT u.id_usuario, u.nombre, u.correo, r.nombre AS rol
+    `SELECT u.id_usuario, u.nombre, u.correo, u.contrasena, r.nombre AS rol
      FROM usuario u
      JOIN rol r ON u.id_rol = r.id_rol
      WHERE u.correo = ? AND u.contrasena = ?`, // Filtra los resultados usando placeholders seguros '(?)'
     [correo, contrasena], // Inyecta las variables limpias de usuario a la validación de base de datos
-    (err, results) => { // Función flecha de callback (Callback) de llamada tras la ejecución MySQL
+    async (err, results) => { // Función flecha de callback (Callback) de llamada tras la ejecución MySQL
       if (err) return res.status(500).json({ mensaje: 'Error del servidor' }); // Retorna fallo HTTP 500 si la base de datos arrojó una excepción técnica 
       if (results.length === 0) { // Si el Array de resultados viene vacío significa que las credenciales no hacen "Match" (No existe el par correo/clave)
         return res.status(401).json({ mensaje: 'Correo o contraseña incorrectos' }); // Emite explícitamente Rechazo de Autorización (HTTP 401 Unauthorized)
       }
       const usuarioData = results[0]; // Extrae el primer (y esperado único) registro validado desde la matriz del query
-      res.json({ mensaje: 'Login exitoso', usuario: usuarioData }); // Entrega alegremente el payload (Datos permitidos) al framework frontend
-      // Ejecuta asincrónicamente el guardado del incidente al libro de auditorías (Bitácora)
-      registrarMovimiento(usuarioData.id_usuario, usuarioData.id_rol, 'LOGIN', `Sesión Inicada (Manual). Autenticado como ${usuarioData.nombre} (${correo}) bajo el rol de ${usuarioData.rol}.`);
+      
+      let isMatch = false;
+      if (usuarioData.contrasena && usuarioData.contrasena.startsWith('$2b$')) {
+        isMatch = await bcrypt.compare(contrasena, usuarioData.contrasena);
+      } else {
+        isMatch = (contrasena === usuarioData.contrasena);
+      }
+      if (!isMatch) return res.status(401).json({ mensaje: 'Correo o contraseña incorrectos' });
+      
+      const token = jwt.sign(
+        { id_usuario: usuarioData.id_usuario, rol: usuarioData.rol, correo: usuarioData.correo },
+        process.env.JWT_SECRET || 'super_secreto_proevent_123',
+        { expiresIn: '8h' }
+      );
+      delete usuarioData.contrasena;
+
+      res.json({ mensaje: 'Login exitoso', token, usuario: usuarioData });
+      registrarMovimiento(usuarioData.id_usuario, usuarioData.rol, 'LOGIN', `Sesión Iniciada (Manual). Autenticado como ${usuarioData.nombre} (${correo}) bajo el rol de ${usuarioData.rol}.`);
     }
   );
 });
@@ -197,7 +247,7 @@ app.post('/login-google', async (req, res) => { // Endpoint POST independiente d
 
     // Ahora, realiza un chequeo intrínseco preguntando si este correo verificado externo existe empadronado positivamente dentro del software local
     db.query(
-      `SELECT u.id_usuario, u.nombre, u.correo, r.nombre AS rol
+      `SELECT u.id_usuario, u.nombre, u.correo, u.contrasena, r.nombre AS rol
        FROM usuario u
        JOIN rol r ON u.id_rol = r.id_rol
        WHERE u.correo = ?`, // Busca estrictamente en columnario por correo ignorando contraseñas tradicionales
@@ -210,7 +260,14 @@ app.post('/login-google', async (req, res) => { // Endpoint POST independiente d
         }
         // Éxito comprobado, el correo está registrado y habilitado funcionalmente
         const usuarioData = results[0]; // Captura y aparta en variable literal pura el paquete local del dependiente institucional
-        res.json({ mensaje: 'Login exitoso', usuario: usuarioData }); // Permite entrada pasiva y le dispensa paralelamente su información de acceso interior en estructura JSON al app cliente reactivo
+        
+        const token = jwt.sign(
+          { id_usuario: usuarioData.id_usuario, rol: usuarioData.rol, correo: usuarioData.correo },
+          process.env.JWT_SECRET || 'super_secreto_proevent_123',
+          { expiresIn: '8h' }
+        );
+        delete usuarioData.contrasena;
+        res.json({ mensaje: 'Login exitoso', token, usuario: usuarioData }); // Permite entrada pasiva y le dispensa paralelamente su información de acceso interior en estructura JSON al app cliente reactivo
         // Emplaza y archiva operativamente este acceso exterior exitoso de manera singular en el reporte histórico imborrable del sistema corporativo (Bitácora) 
         registrarMovimiento(usuarioData.id_usuario, usuarioData.id_rol, 'LOGIN_GOOGLE', `Sesión Inicada (Google OAuth). Autenticado como ${usuarioData.nombre} (${correo}) bajo el rol de ${usuarioData.rol}.`);
       }
@@ -225,11 +282,11 @@ app.post('/login-google', async (req, res) => { // Endpoint POST independiente d
 // OBTENER la lista completa de TODOS LOS USUARIOS adjuntando su denominación de Rol (Join)
 app.get('/usuarios', (req, res) => { // Establece ruta HTTP GET universal en '/usuarios' para listados generales
   db.query( // Dispara y procesa sentencia MySQL a ejecutar 
-    `SELECT u.id_usuario, u.nombre, u.correo, r.nombre AS rol
+    `SELECT u.id_usuario, u.nombre, u.correo, u.contrasena, r.nombre AS rol
      FROM usuario u
      JOIN rol r ON u.id_rol = r.id_rol`, // Une las dos entidades tabulares para traer el texto legible humano del "Rol" y no solo el ID numérico frío indexado
     (err, results) => { // Función anonima Callback
-      if (err) return res.status(500).json({ error: err }); // Redirige en vivo un error técnico o fallo persistente como respuesta interceptable terminal Server-error
+      if (err) return res.status(500).json({ error: 'Error interno' }); // Redirige en vivo un error técnico o fallo persistente como respuesta interceptable terminal Server-error
       res.json(results); // Analiza, formatea, e hidrata masivamente en texto el conjunto compilado entregado en JSON Array para presentarlo al framework client
     }
   );
@@ -252,7 +309,7 @@ app.get('/bitacora', (req, res) => { // Construye y expone la ruta vital GET '/b
     ORDER BY b.fecha DESC; -- Ordena visualmente y operativamente siempre mostrando los eventos de actividad más frescos y transaccionales temporalmente recientes priorizados en la cima alta
   `;
   db.query(query, (err, results) => { // Efectúa internamente la lectura pasiva profunda del hilo MySQL
-    if (err) return res.status(500).json({ error: err }); // Delegación estándar de abort failure handling
+    if (err) return res.status(500).json({ error: 'Error interno' }); // Delegación estándar de abort failure handling
     res.json(results); // Encapsula y envía la respuesta global cruda generada por todos los registros clasificados en cascada tipo JSON Object Array al cliente virtual UI Frontend
   });
 });
@@ -260,27 +317,27 @@ app.get('/bitacora', (req, res) => { // Construye y expone la ruta vital GET '/b
 // OBTENER el compendio inmutable de ROLES estáticos disponibles listos para ser usados en el engranaje del sistema (Normalmente selectores Select/Combobox Modales)
 app.get('/roles', (req, res) => { // Asignación de Ruta simple universal '/roles'
   db.query('SELECT * FROM rol', (err, results) => { // Trae forzadamente el íntegro universal existente desglosado localmente de la tabla incondicional 'rol'
-    if (err) return res.status(500).json({ error: err }); // Retorno inminente fatal si explícitamente falla todo el fetch backend
+    if (err) return res.status(500).json({ error: 'Error interno' }); // Retorno inminente fatal si explícitamente falla todo el fetch backend
     res.json(results); // Emisión simple nativa directa de un conjunto inactivo generalizado con opciones únicas de roles paramétricos integrales
   });
 });
 
 // --- RUTAS DE ESCRITURA Y MUTACIÓN ACTIVA (CRUD USUARIOS) ---
 // CREAR UN NUEVO USUARIO EN PANEL ADMINISTRATIVO (Método POST de inyección)
-app.post('/usuarios', (req, res) => { // Asigna protocolo procedimental POST apuntado explícitamente a '/usuarios'
+app.post('/usuarios', async (req, res) => { // Asigna protocolo procedimental POST apuntado explícitamente a '/usuarios'
   const { nombre, correo, contrasena, id_rol } = req.body; // Cosecha las especificaciones emitidas por el frontend a raíz del formulario modal orgánico rellenado
   if (!nombre || !correo || !contrasena || !id_rol) { // Mecanismo encriptado de control interno validacional previo estructural para proteger la BD de peticiones erróneamente vacías o de origen nulo dudoso (Filtro Anti-Nulls)
     return res.status(400).json({ mensaje: 'Todos los campos son obligatorios' }); // Rechaza procedencia terminantemente ante la imperativa escasez detectada de alguno de los 4 pilares informativos primordiales
   }
   db.query( // Realiza transaccionalmente un intento forzado de insercion relacional MySQL blindado asimétricamente con prepare-statement posicional ("?") para contrarrestar ataques cibernéticos elementales
     'INSERT INTO usuario (nombre, correo, contrasena, id_rol) VALUES (?, ?, ?, ?)', 
-    [nombre, correo, contrasena, id_rol], // Despliega e imbrica iterativamente la matriz natural emparejada correspondientemente a los placeholders huecos variables de la sentencia final en cadena generada
+    [nombre, correo, await bcrypt.hash(contrasena, 10), id_rol], // Despliega e imbrica iterativamente la matriz natural emparejada correspondientemente a los placeholders huecos variables de la sentencia final en cadena generada
     (err, result) => {
       if (err) { // Manejador condicional iterativo estricto ramificado en base a la respuesta literal del servidor MySQL
         if (err.code === 'ER_DUP_ENTRY') { // Constata y sub-analiza comparativamente de manera explícita interna si el gestor MySQL flagrantemente detectó rebotando que el índice físico fue violado en pura duplicidad prohibitiva (UNIQUE KEY interpuesta artificialmente en correo)
           return res.status(409).json({ mensaje: 'El correo ya está registrado' }); // Traduce diplomáticamente el tecnicismo de backend a una respuesta cliente frontend 100% amigable y legible etiquetada con código de bloqueo '409 Conflict'
         }
-        return res.status(500).json({ mensaje: 'Error al crear usuario', error: err }); // Redundancia y Falla genérica genérica absoluta no relacionada en esencia a factores obvios controlables (duplicados lógicos u ausencias de rellenado)
+        return res.status(500).json({ mensaje: 'Error al crear usuario', error: 'Error interno' }); // Redundancia y Falla genérica genérica absoluta no relacionada en esencia a factores obvios controlables (duplicados lógicos u ausencias de rellenado)
       }
       res.status(201).json({ mensaje: 'Usuario creado con éxito', id: result.insertId }); // Manifiesta veredicta positivamente Éxito absoluto final emitiendo estatus de entidad forjada HTTP 201 (Created), transmitiéndole correlativamente el nuevo numérico nominal de llave primaria autogenerada MySQL finalizada satisfactoriamente (insertId referenciado)
       
@@ -291,7 +348,7 @@ app.post('/usuarios', (req, res) => { // Asigna protocolo procedimental POST apu
 });
 
 // ACTUALIZAR LOS METADATOS Y VARIABLES ATRIBUIBLES DE UN USUARIO EXISTENTE EXTERNO (Método PUT dinámico multi-factor)
-app.put('/usuarios/:id', (req, res) => { // Genera la Ruta PUT hacia URI interna /usuarios portando y enlazando conjuntivamente un componente de parámetro referencial subyacente wildcard paramétrico literal '/:id' para constatar individualizada y unitariamente inequívocamente a cual único usuario existente se le va a castigar mutando su realidad relacional
+app.put('/usuarios/:id', async (req, res) => { // Genera la Ruta PUT hacia URI interna /usuarios portando y enlazando conjuntivamente un componente de parámetro referencial subyacente wildcard paramétrico literal '/:id' para constatar individualizada y unitariamente inequívocamente a cual único usuario existente se le va a castigar mutando su realidad relacional
   const { id } = req.params; // Saca, extrae e individualiza nominalmente el parámetro puro indexado integral literal forzado dentro de la URl misma HTTP enrutada al resolver la expresión estática
   const { nombre, correo, contrasena, id_rol } = req.body; // Cosecha e interpreta descriptivamente la envoltura útil desde adentro profundo del cuerpo adjuntado original (body form JSON inyectado)
 
@@ -300,7 +357,7 @@ app.put('/usuarios/:id', (req, res) => { // Genera la Ruta PUT hacia URI interna
       'UPDATE usuario SET nombre = ?, correo = ?, contrasena = ?, id_rol = ? WHERE id_usuario = ?', // Plantilla query string forjada
       [nombre, correo, contrasena, id_rol, id], // Distribuye ordenadamente las facetas mutadas e íntegras en conjunto al identificativo que asienta la métrica limitante en conjunción resolutoria posicional a un único respectivo sufijo unitario originario paramétrico id final de línea base condicional limitativo condicionado restrictivamente que encaja herméticamente la ineludible condición inquebrantable de parada de scope operativo limitrofe totalitario (Clausula fundamental WHERE restrictiva)
       (err) => { // Funcion manejadora subyacente lambda callback
-        if (err) return res.status(500).json({ mensaje: 'Error al actualizar usuario', error: err }); // Escape prematuro por default e interrupción forzada natural ante eventual manifestación física no controlable a eventual avería catastrofíla MySQL local (Status 500 Code)
+        if (err) return res.status(500).json({ mensaje: 'Error al actualizar usuario', error: 'Error interno' }); // Escape prematuro por default e interrupción forzada natural ante eventual manifestación física no controlable a eventual avería catastrofíla MySQL local (Status 500 Code)
         res.json({ mensaje: 'Usuario actualizado con éxito' }); // Suministra luz verde y autorización moral afirmativa generalizada con estatus 200 resolutivo estático exitoso pleno definitivo hacia el entorno espectral del marco renderizado componente del front end cliente terminal UI
         const adminId = req.headers['x-usuario-id']; // Inspecciona el encabezado encubierto Header intrínseco inyectado artificialmente previamenten por interceptor Intercept-Like frontend para recuperar al autor admin verazmente
         if(adminId) registrarMovimiento(adminId, null, 'ACTUALIZACION_USUARIO', `Modificación de Perfil. ID afectado: ${id}. Nuevos datos -> Nombre: ${nombre}, Correo: ${correo}, Rol ID: ${id_rol}. (Contraseña modificada)`); // Bitácora y libro log operativo incuestionable explícito auditado internamente en formato legible texto libre natural alertando y delatando intencionalmente cambios drásticos inmiscuibles profundamente intrusivos e invasivos vitalmente operacionales a la infraestructura original ajena incluyendo recambio rotacional directo de credenciales de seguridad limitantes claves (contraseñas mutantes reseteadas autoritariamente)
@@ -311,7 +368,7 @@ app.put('/usuarios/:id', (req, res) => { // Genera la Ruta PUT hacia URI interna
       'UPDATE usuario SET nombre = ?, correo = ?, id_rol = ? WHERE id_usuario = ?',
       [nombre, correo, id_rol, id],
       (err) => {
-        if (err) return res.status(500).json({ mensaje: 'Error al actualizar usuario', error: err });
+        if (err) return res.status(500).json({ mensaje: 'Error al actualizar usuario', error: 'Error interno' });
         res.json({ mensaje: 'Usuario actualizado con éxito' });
         const adminId = req.headers['x-usuario-id'];
         if(adminId) registrarMovimiento(adminId, null, 'ACTUALIZACION_USUARIO', `Modificación de Perfil. ID afectado: ${id}. Nuevos datos -> Nombre: ${nombre}, Correo: ${correo}, Rol ID: ${id_rol}. (Sin alterar contraseña)`);
@@ -324,7 +381,7 @@ app.put('/usuarios/:id', (req, res) => { // Genera la Ruta PUT hacia URI interna
 app.delete('/usuarios/:id', (req, res) => { // Enruta peticiones Delete apuntando a un wildcard dinámico :id discriminador 
   const { id } = req.params; // Extrae el número identificador del segmento URL
   db.query('DELETE FROM usuario WHERE id_usuario = ?', [id], (err) => { // Ejecuta sentencia irrecuperable paramétrica de borrado físico del registro en tabla 'usuario'
-    if (err) return res.status(500).json({ mensaje: 'Error al eliminar usuario', error: err }); // Fracaso por llave foránea atada o fallo motor MySQL
+    if (err) return res.status(500).json({ mensaje: 'Error al eliminar usuario', error: 'Error interno' }); // Fracaso por llave foránea atada o fallo motor MySQL
     res.json({ mensaje: 'Usuario eliminado con éxito' }); // Éxito en borrado
     const adminId = req.headers['x-usuario-id']; // Identificador del autor (El administrador que presionó el botón de borrado)
     if(adminId) registrarMovimiento(adminId, null, 'ELIMINACION_USUARIO', `Eliminación permanente de cuenta de usuario. ID del usuario erradicado: ${id}.`); // Bitácora de extrema sensibilidad para justificar la desaparición de usuarios (Traceability total)
@@ -335,7 +392,7 @@ app.delete('/usuarios/:id', (req, res) => { // Enruta peticiones Delete apuntand
 // OBTENER el catálogo íntegro de dependencias departamentales registradas en el sistema orgánico de la UAPA
 app.get('/dependencias', (req, res) => { // Endpoint genérico de lectura /dependencias
   db.query('SELECT * FROM dependencia', (err, results) => { // Lectura masiva simple del catálogo
-    if (err) return res.status(500).json({ error: err }); // Fallback control de fallo base de datos
+    if (err) return res.status(500).json({ error: 'Error interno' }); // Fallback control de fallo base de datos
     res.json(results); // Envía los objetos array formados
   });
 });
@@ -343,7 +400,7 @@ app.get('/dependencias', (req, res) => { // Endpoint genérico de lectura /depen
 // OBTENER la lista inamovible estructural física de recintos y sub-sedes universitarias
 app.get('/recintos', (req, res) => { // Recurso de extracción GET '/recintos'
   db.query('SELECT * FROM recinto', (err, results) => { // Barrido general para alimentar un Selector/Combobox
-    if (err) return res.status(500).json({ error: err }); // Handler de error de base de datos
+    if (err) return res.status(500).json({ error: 'Error interno' }); // Handler de error de base de datos
     res.json(results); // Serializa resultados a text/json
   });
 });
@@ -388,7 +445,7 @@ app.post('/eventos', async (req, res) => { // Declaración Async para el Endpoin
       });
     }
   } catch (err) {
-    return res.status(500).json({ mensaje: 'Error al verificar conflictos de horario', error: err.message });
+    return res.status(500).json({ mensaje: 'Error al verificar conflictos de horario', error: 'Error interno de la base de datos' });
   }
 
   // MOTOR MULTIMONEDA PARA ESTIMACIÓN FINANCIERA
@@ -425,25 +482,46 @@ app.post('/eventos', async (req, res) => { // Declaración Async para el Endpoin
         return res.status(400).json({ mensaje: 'No hay un año fiscal registrado que coincida con la fecha del evento para asignar POA.' }); // Alarma la ausencia de configuraciones base POA para sostén
       }
     } catch (err) { // Evita que caiga la red
-      return res.status(500).json({ mensaje: 'Error verificando POA', error: err.message }); // Falla interna de la comprobacion promise db
+      return res.status(500).json({ mensaje: 'Error verificando POA', error: 'Error interno de la base de datos' }); // Falla interna de la comprobacion promise db
+    }
+  }
+
+  // --- RESOLVER ID TIPO EVENTO ---
+  let id_tipo_evento = null;
+  if (tipo_evento) {
+    try {
+      const [tipos] = await db.promise().query('SELECT id_tipo_evento FROM tipo_evento_master WHERE nombre = ?', [tipo_evento]);
+      if (tipos.length > 0) id_tipo_evento = tipos[0].id_tipo_evento;
+    } catch (err) {
+      console.error('Error buscando tipo de evento', err);
     }
   }
 
   // --- INSERCIÓN EN TABLA PADRE: EVENTO ---
   db.query( // Si la transacción superó incólume las verificaciones monetarias pasadas, comienza el registro físico vital de la solicitud cruda en evento
     `INSERT INTO evento (nombre, modalidad, fecha_inicio, fecha_fin, hora_inicio, hora_fin,
-      cantidad_asistentes, tipo_evento, monto_poa, moneda, id_usuario, id_dependencia, id_recinto)
+      cantidad_asistentes, id_tipo_evento, monto_poa, moneda, id_usuario, id_dependencia, id_recinto)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, // Estructura un insert multi-paramétrico estricto de valores
     [nombre, modalidad, fecha_inicio, fecha_fin, hora_inicio, hora_fin,
-      cantidad_asistentes, tipo_evento, monto_poa, moneda, id_usuario, id_dependencia, id_recinto], // Despliega la matriz asociativa estricta hacia SQL crudo nativo
+      cantidad_asistentes, id_tipo_evento, monto_poa, moneda, id_usuario, id_dependencia, id_recinto], // Despliega la matriz asociativa estricta hacia SQL crudo nativo
     (err, result) => { // Callback lambda
-      if (err) return res.status(500).json({ mensaje: 'Error al crear evento', error: err }); // Escape MySQL error
+      if (err) return res.status(500).json({ mensaje: 'Error al crear evento', error: 'Error interno' }); // Escape MySQL error
       const id_evento = result.insertId; // Recoge inmediatamente el AutoIncrement único adjudicado a la tabla madre (Llave primaria evento)
 
       // --- INSERCIONES DE RELACIONES Y TABLAS HIJAS SUB-DIMENSIONADAS (RELACIONES N:M MULTIPLES) ---
       if (detalles_corporativos && detalles_corporativos.length > 0) { // Evalúa de existir si el usuario tildó casillas corporativas checkbox
-        const valoresCorp = detalles_corporativos.map(tipo => [id_evento, tipo]); // Cosecha subarreglo asociado a cada foraneo
-        db.query('INSERT INTO detalle_corporativo (id_evento, tipo) VALUES ?', [valoresCorp], () => { }); // BulkInsert array de multi-datos M:N
+        db.query('SELECT id_detalle_corp, nombre FROM tipo_detalle_corporativo', (errCorp, detallesDB) => {
+          if (!errCorp) {
+            const valoresCorp = [];
+            detalles_corporativos.forEach(nombreCorp => {
+              const encontrado = detallesDB.find(d => d.nombre === nombreCorp);
+              if (encontrado) valoresCorp.push([id_evento, encontrado.id_detalle_corp]);
+            });
+            if (valoresCorp.length > 0) {
+              db.query('INSERT INTO detalle_corporativo (id_evento, id_detalle_corp) VALUES ?', [valoresCorp], () => { }); // BulkInsert array de multi-datos M:N
+            }
+          }
+        });
       }
 
       if (alimentos && alimentos.length > 0) { // Evalúa si la ui envió lista selecta de alimentos (relación multijoin)
@@ -500,7 +578,7 @@ app.post('/poa', (req, res) => { // Declara la ruta POST '/poa'
     'INSERT INTO poa_fiscal (fecha_inicio, fecha_fin, monto_total, monto_disponible, creado_por) VALUES (?, ?, ?, ?, ?)',
     [fecha_inicio, fecha_fin, monto_total, monto_total, reqUserId], // Al nacer, el monto disponible es siempre íntegra y matemáticamente igual al total
     (err, result) => {
-      if (err) return res.status(500).json({ error: err.message }); // Escape en caso de error SQL
+      if (err) return res.status(500).json({ error: 'Error interno de la base de datos' }); // Escape en caso de error SQL
       res.status(201).json({ mensaje: 'POA Creado', id_poa: result.insertId }); // Respuesta exitosa con ID insertado
       if(reqUserId) registrarMovimiento(reqUserId, null, 'CREACION_POA', `Nuevo presupuesto POA por ${monto_total}.`); // Log bitácora obligatoria
     }
@@ -510,7 +588,7 @@ app.post('/poa', (req, res) => { // Declara la ruta POST '/poa'
 // OBTENER TODOS LOS PLANES POA EXISTENTES Y SUS MOVIMIENTOS HISTÓRICOS (GET)
 app.get('/poa', (req, res) => { // Declara el endpoint de listado maestro GET '/poa'
   db.query('SELECT * FROM poa_fiscal ORDER BY fecha_inicio DESC', (err, poas) => { // Busca las carpetas contables matrices ordenadas por la más reciente
-    if (err) return res.status(500).json({ error: err.message }); // Handlder err
+    if (err) return res.status(500).json({ error: 'Error interno de la base de datos' }); // Handlder err
     
     // Anida asincrónicamente una segunda consulta para obtener todos los sub-registros de consumición contable ('poa_movimiento')
     db.query(`
@@ -597,7 +675,7 @@ app.put('/eventos/:id', async (req, res) => { // Asignación de Endpoint dinámi
       });
     }
   } catch (err) {
-    return res.status(500).json({ mensaje: 'Error al verificar conflictos de horario', error: err.message });
+    return res.status(500).json({ mensaje: 'Error al verificar conflictos de horario', error: 'Error interno de la base de datos' });
   }
 
   try {
@@ -656,14 +734,25 @@ app.put('/eventos/:id', async (req, res) => { // Asignación de Endpoint dinámi
       }
     }
 
+    // --- RESOLVER ID TIPO EVENTO ---
+    let id_tipo_evento = null;
+    if (tipo_evento) {
+      try {
+        const [tipos] = await dbPromise.query('SELECT id_tipo_evento FROM tipo_evento_master WHERE nombre = ?', [tipo_evento]);
+        if (tipos.length > 0) id_tipo_evento = tipos[0].id_tipo_evento;
+      } catch (err) {
+        console.error('Error buscando tipo de evento', err);
+      }
+    }
+
     // --- ACTUALIZACION DEL EVENTO ---
     const sql = `UPDATE evento SET 
       nombre = ?, modalidad = ?, fecha_inicio = ?, fecha_fin = ?, 
       hora_inicio = ?, hora_fin = ?, cantidad_asistentes = ?, 
-      tipo_evento = ?, id_recinto = ?, id_dependencia = ?,
+      id_tipo_evento = ?, id_recinto = ?, id_dependencia = ?,
       monto_poa = ?, moneda = ?
       WHERE id_evento = ?`;
-    const params = [nombre, modalidad, fecha_inicio, fecha_fin, hora_inicio, hora_fin, cantidad_asistentes, tipo_evento, id_recinto, id_dependencia, monto_poa, moneda, id];
+    const params = [nombre, modalidad, fecha_inicio, fecha_fin, hora_inicio, hora_fin, cantidad_asistentes, id_tipo_evento, id_recinto, id_dependencia, monto_poa, moneda, id];
     
     await dbPromise.query(sql, params);
 
@@ -695,8 +784,18 @@ app.put('/eventos/:id', async (req, res) => { // Asignación de Endpoint dinámi
     // Usamos callbacks normales para operaciones no-bloqueantes de satélites
     db.query('DELETE FROM detalle_corporativo WHERE id_evento = ?', [id], () => {
       if (detalles_corporativos && detalles_corporativos.length > 0) {
-        const valoresCorp = detalles_corporativos.map(tipo => [id, tipo]);
-        db.query('INSERT INTO detalle_corporativo (id_evento, tipo) VALUES ?', [valoresCorp], () => { });
+        db.query('SELECT id_detalle_corp, nombre FROM tipo_detalle_corporativo', (errCorp, detallesDB) => {
+          if (!errCorp) {
+            const valoresCorp = [];
+            detalles_corporativos.forEach(nombreCorp => {
+              const encontrado = detallesDB.find(d => d.nombre === nombreCorp);
+              if (encontrado) valoresCorp.push([id, encontrado.id_detalle_corp]);
+            });
+            if (valoresCorp.length > 0) {
+              db.query('INSERT INTO detalle_corporativo (id_evento, id_detalle_corp) VALUES ?', [valoresCorp], () => { });
+            }
+          }
+        });
       }
     });
 
@@ -728,7 +827,7 @@ app.put('/eventos/:id', async (req, res) => { // Asignación de Endpoint dinámi
 
   } catch (err) {
     console.error('Error en reconciliacion PUT /eventos:', err.message);
-    return res.status(500).json({ mensaje: 'Error al actualizar evento o conciliar POA', error: err.message });
+    return res.status(500).json({ mensaje: 'Error al actualizar evento o conciliar POA', error: 'Error interno de la base de datos' });
   }
 });
 
@@ -737,7 +836,8 @@ app.get('/eventos', (req, res) => { // Declara la gran ruta HTTP GET '/eventos'
   const { usuario_id } = req.query; // Permite discriminar la vista extrayendo el parametro de busqueda URL Query String param
   let sql = `SELECT
        e.id_evento, e.nombre, e.modalidad, e.fecha_inicio, e.fecha_fin,
-       e.hora_inicio, e.hora_fin, e.cantidad_asistentes, e.tipo_evento,
+       e.hora_inicio, e.hora_fin, e.cantidad_asistentes, 
+       tm.nombre AS tipo_evento, e.id_tipo_evento,
        e.monto_poa, e.moneda, e.estado, e.fecha_creacion,
        e.id_recinto, e.id_dependencia,
        pm.estado AS estado_poa,
@@ -745,12 +845,15 @@ app.get('/eventos', (req, res) => { // Declara la gran ruta HTTP GET '/eventos'
        u.id_usuario,
        d.nombre  AS dependencia,
        r.nombre  AS recinto,
-       (SELECT GROUP_CONCAT(dc.tipo SEPARATOR ', ') FROM detalle_corporativo dc WHERE dc.id_evento = e.id_evento) AS detalles_corporativos,
+       (SELECT GROUP_CONCAT(dc.id_detalle_corp SEPARATOR ',') FROM detalle_corporativo dc WHERE dc.id_evento = e.id_evento) AS id_detalles_corporativos,
+       (SELECT GROUP_CONCAT(tdc.nombre SEPARATOR ', ') FROM detalle_corporativo dc JOIN tipo_detalle_corporativo tdc ON dc.id_detalle_corp = tdc.id_detalle_corp WHERE dc.id_evento = e.id_evento) AS detalles_corporativos,
+       (SELECT GROUP_CONCAT(ea.id_alimento SEPARATOR ',') FROM evento_alimento ea WHERE ea.id_evento = e.id_evento) AS id_alimentos,
        (SELECT GROUP_CONCAT(a.nombre SEPARATOR ', ') FROM evento_alimento ea JOIN alimento a ON ea.id_alimento = a.id_alimento WHERE ea.id_evento = e.id_evento) AS alimentos,
        (SELECT GROUP_CONCAT(dm.descripcion SEPARATOR ' | ') FROM detalle_montaje dm WHERE dm.id_evento = e.id_evento) AS observaciones,
        IF((SELECT COUNT(*) FROM servicio_audiovisual sa WHERE sa.id_evento = e.id_evento) > 0, 1, 0) AS necesita_audiovisual,
-       (SELECT GROUP_CONCAT(CONCAT(sa.cantidad, 'x ', sa.tipo_servicio) SEPARATOR ', ') FROM servicio_audiovisual sa WHERE sa.id_evento = e.id_evento AND sa.estado != 'Rechazado') AS equipos_audiovisuales
+       (SELECT GROUP_CONCAT(CONCAT(sa.cantidad, 'x ', eq.nombre) SEPARATOR ', ') FROM servicio_audiovisual sa JOIN equipo_audiovisual eq ON sa.id_equipo = eq.id_equipo WHERE sa.id_evento = e.id_evento AND sa.estado != 'Rechazado') AS equipos_audiovisuales
      FROM evento e
+     LEFT JOIN tipo_evento_master tm ON e.id_tipo_evento = tm.id_tipo_evento
      LEFT JOIN poa_movimiento pm ON e.id_evento = pm.id_evento
      LEFT JOIN usuario     u ON e.id_usuario     = u.id_usuario
      LEFT JOIN dependencia d ON e.id_dependencia = d.id_dependencia
@@ -765,7 +868,7 @@ app.get('/eventos', (req, res) => { // Declara la gran ruta HTTP GET '/eventos'
   sql += ` ORDER BY e.fecha_creacion DESC`; // Ordena cronológicamente descendente por default
 
   db.query(sql, params, (err, results) => { // Lectura final
-    if (err) return res.status(500).json({ error: err.message }); // Ataja de inmediato error MySQL
+    if (err) return res.status(500).json({ error: 'Error interno de la base de datos' }); // Ataja de inmediato error MySQL
     res.json(results); // Serializa masivamente el conjunto crudo parseandolo transparentemente en un modelo JSON legible de Array 
   });
 });
@@ -785,7 +888,7 @@ app.get('/calendario-eventos', (req, res) => { // Endpoint dedicado a despachar 
   `; // Select parcial que ignora data confidencial administrativa e incluye banderas booleanas IF
 
   db.query(sql, (err, results) => { // Lanza Query
-    if (err) return res.status(500).json({ error: err.message }); // Error Handling
+    if (err) return res.status(500).json({ error: 'Error interno de la base de datos' }); // Error Handling
 
     const processed = results.map(evt => { // Despliega iterador funcional Map sobre matriz bruta para formatear un nuevo objeto anónimo calibrado para React-Big-Calendar Standard
       const esPropio = usuario_id && evt.id_usuario == usuario_id; // Validación booleana analizando Posesión (Si el evento iterado me pertenece o es de alguien ajeno en la red institucional)
@@ -812,7 +915,7 @@ app.put('/eventos/:id/estado', (req, res) => { // Edición atómica puramente en
   if (!estadosValidos.includes(estado)) // Caza intentos de asignar estados inexistentes inventados por hackers o bugs  
     return res.status(400).json({ mensaje: 'Estado no válido' }); // Prohibe cambio de estatus corrupto 
   db.query('UPDATE evento SET estado=? WHERE id_evento=?', [estado, id], (err) => { // Impacta BD estrictamente
-    if (err) return res.status(500).json({ mensaje: 'Error al actualizar estado', error: err.message }); // Handle
+    if (err) return res.status(500).json({ mensaje: 'Error al actualizar estado', error: 'Error interno de la base de datos' }); // Handle
     res.json({ mensaje: 'Estado actualizado con éxito' }); // Terminado okay HTTP Response
     const reqUserId = req.headers['x-usuario-id']; // Quien aprueba/rechaza
     if(reqUserId) registrarMovimiento(reqUserId, null, 'ACTUALIZACION_EVENTO', `Resolución de Estado del Evento. El Evento con ID ${id} ha pasado al estado: "${estado}".`); // Trazo logístico
@@ -826,7 +929,7 @@ app.delete('/eventos/:id', (req, res) => { // Ruta explícita DELETE masivo de c
     db.query('DELETE FROM evento_alimento WHERE id_evento=?', [id], () => { // Cadena callback 2: Borrado de relación de nodos puente alimentos
       db.query('DELETE FROM detalle_montaje WHERE id_evento=?', [id], () => { // Cadena callback 3: Borrado de descripciones anexas de montaje
         db.query('DELETE FROM evento WHERE id_evento=?', [id], (err) => { // Fin de cascada Callback Hell piramidal manual: Extinción del Padre/Tronco Matrix del suceso central
-          if (err) return res.status(500).json({ mensaje: 'Error al eliminar evento', error: err.message }); // Falla de sustracción profunda
+          if (err) return res.status(500).json({ mensaje: 'Error al eliminar evento', error: 'Error interno de la base de datos' }); // Falla de sustracción profunda
           res.json({ mensaje: 'Evento eliminado con éxito' }); // Respuesta limpia tras purga
           const reqUserId = req.headers['x-usuario-id']; // Autoria identificativa
           if(reqUserId) registrarMovimiento(reqUserId, null, 'ELIMINACION_EVENTO', `Cancelación y Borrado de Evento. Evento afectado ID: ${id}.`); // Confirmacion Bitacora de borrado de root tree evento
@@ -847,7 +950,7 @@ app.post('/audiovisual', (req, res) => { // Endpoint de generacion POST /audiovi
 
   // 1. Validar la estricta regla organizacional de 5 días mínimos calendarios requeridos de anticipación técnica 
   db.query('SELECT fecha_inicio FROM evento WHERE id_evento = ?', [id_evento], (err, results) => { // Primero lee fecha planeada matriz
-    if (err) return res.status(500).json({ mensaje: 'Error al buscar el evento', error: err.message }); // Caida DB MySQL
+    if (err) return res.status(500).json({ mensaje: 'Error al buscar el evento', error: 'Error interno de la base de datos' }); // Caida DB MySQL
     if (results.length === 0) return res.status(404).json({ mensaje: 'Evento no encontrado' }); // ID Foraneo corrupto false / Desaparecido
 
     const fechaEvento = new Date(results[0].fecha_inicio); // Construye Data Object referencial real calculable apuntando a la fecha evento guardada
@@ -867,23 +970,28 @@ app.post('/audiovisual', (req, res) => { // Endpoint de generacion POST /audiovi
     }
 
     // 2. Transaccion pre-condición aceptada: Insertar masivamente los servicios reales limpios pre-filtrados en db con map bulk
-    const values = servicios.map(s => { // Generacion del array dimensional anidado usando .map() list traversal function
-      // Estructura posicional parametrizada de columnas: (id_evento, tipo_servicio, estado, cantidad, ubicacion, observaciones)
-      return [ // Bracket array sub-indice
-        id_evento, // Foreign key link principal
-        s.equipo, // Item string nominal del equipo
-        'Pendiente', // Estatus text inmutable forzado al momento de creación
-        s.cantidad || 1,  // Cantidad solicitada (Fallo positivo asume 1 unidad como valor mínimo estándar base)
-        s.ubicacion || '', // String metadata location text field
-        s.observaciones || '' // Metadata comments string field
-      ];
-    });
+    db.query('SELECT id_equipo, nombre FROM equipo_audiovisual', (errEq, equiposDB) => {
+      if (errEq) return res.status(500).json({ mensaje: 'Error al buscar catálogo audiovisual' });
 
-    db.query('INSERT INTO servicio_audiovisual (id_evento, tipo_servicio, estado, cantidad, ubicacion, observaciones) VALUES ?', [values], (errInsert) => { // Ejecuta Bulkinsert masivo blindado de la matriz preparada posicional
-      if (errInsert) return res.status(500).json({ mensaje: 'Error al registrar servicios', error: errInsert.message });
-      res.status(201).json({ mensaje: 'Solicitud audiovisual registrada con éxito' });
-      const reqUserId = req.headers['x-usuario-id'];
-      if(reqUserId) registrarMovimiento(reqUserId, null, 'CREACION_AUDIOVISUAL', `Se levantó una Solicitud de Servicios Audiovisuales. Evento Asociado ID: ${id_evento}. Equipos requeridos: ${servicios.map(s => s.equipo).join(', ')}.`);
+      const values = servicios.map(s => {
+        const encontrado = equiposDB.find(eq => eq.nombre === s.equipo);
+        const id_equipo = encontrado ? encontrado.id_equipo : 1;
+        return [
+          id_evento,
+          id_equipo,
+          'Pendiente',
+          s.cantidad || 1,
+          s.ubicacion || '',
+          s.observaciones || ''
+        ];
+      });
+
+      db.query('INSERT INTO servicio_audiovisual (id_evento, id_equipo, estado, cantidad, ubicacion, observaciones) VALUES ?', [values], (errInsert) => { // Ejecuta Bulkinsert masivo blindado de la matriz preparada posicional
+        if (errInsert) return res.status(500).json({ mensaje: 'Error al registrar servicios', error: errInsert.message });
+        res.status(201).json({ mensaje: 'Solicitud audiovisual registrada con éxito' });
+        const reqUserId = req.headers['x-usuario-id'];
+        if(reqUserId) registrarMovimiento(reqUserId, null, 'CREACION_AUDIOVISUAL', `Se levantó una Solicitud de Servicios Audiovisuales. Evento Asociado ID: ${id_evento}. Equipos requeridos: ${servicios.map(s => s.equipo).join(', ')}.`);
+      });
     });
   });
 });
@@ -892,11 +1000,12 @@ app.post('/audiovisual', (req, res) => { // Endpoint de generacion POST /audiovi
 app.get('/audiovisual', (req, res) => { // Endpoint de lectura gerencial administrativa GET /audiovisual
   const { usuario_id } = req.query; // Permite discriminar la vista extrayendo el parametro de filtro por owner URL Query String param
   let sql = `SELECT 
-       s.id_servicio, s.id_evento, s.tipo_servicio, s.estado AS estado_av,  -- Renombramiento Alias para evadir colisiones semánticas con estado del root evento
+       s.id_servicio, s.id_evento, eq.nombre AS tipo_servicio, s.id_equipo, s.estado AS estado_av,  -- Renombramiento Alias para evadir colisiones semánticas con estado del root evento
        s.cantidad, s.ubicacion, s.observaciones,
        e.nombre AS nombre_evento, e.fecha_inicio, r.nombre AS recinto,
        e.id_usuario, u.nombre AS nombre_usuario
      FROM servicio_audiovisual s
+     JOIN equipo_audiovisual eq ON s.id_equipo = eq.id_equipo
      JOIN evento e ON s.id_evento = e.id_evento -- Amarre fuerte obligatorio (INNER JOIN) con la matrix de Evento (El servicio no puede existir huérfano)
      LEFT JOIN recinto r ON e.id_recinto = r.id_recinto -- Amarre débil izquierdo con su recinto posicional
      LEFT JOIN usuario u ON e.id_usuario = u.id_usuario`; // Amarre débil izquierdo con la firma de creador
@@ -910,7 +1019,7 @@ app.get('/audiovisual', (req, res) => { // Endpoint de lectura gerencial adminis
   sql += ` ORDER BY s.id_servicio DESC`; // Disposición lógica natural descendente para ver lo nuevo en la cima (LIFO visual)
 
   db.query(sql, params, (err, results) => { // Despliegue de DB callback
-    if (err) return res.status(500).json({ error: err.message }); // Ataja de inmediato error MySQL
+    if (err) return res.status(500).json({ error: 'Error interno de la base de datos' }); // Ataja de inmediato error MySQL
 
     const parsedResults = results.map(row => { // Algoritmo de mapeo puramente preventivo
         // Fallback robusto en caso de que aún exista data comprimida vieja incrustada en BD heredada del diseño antiguo (ej: Proyector|Cant:2|Ubic:A)
@@ -958,7 +1067,7 @@ app.put('/audiovisual/:id/estado', (req, res) => { // Endpoint de mutabilidad di
   db.query('UPDATE servicio_audiovisual SET estado=? WHERE id_servicio=?', [estado, id], (err, result) => { // Activa UPDATE MySQL de una sola pieza referida apuntando exclusivamente al row especifico del Service Item id
     if (err) { // Handle callback Error
       console.error('Update Error:', err); // Aviso Logger Silencioso NodeJS Host
-      return res.status(500).json({ mensaje: 'Error al actualizar estado', error: err.message }); // Rechazo final HTTP Backend down status 500
+      return res.status(500).json({ mensaje: 'Error al actualizar estado', error: 'Error interno de la base de datos' }); // Rechazo final HTTP Backend down status 500
     }
     console.log(`Update Result for id ${id}:`, result); // Logger satisfactorio de depuracion 
     res.json({ mensaje: 'Estado audiovisual actualizado con éxito', affectedRows: result.affectedRows }); // HTTP response emite cuantas filas exactas se alteraron (deberia ser 1 siempre)
@@ -979,7 +1088,7 @@ app.put('/audiovisual/evento/:id_evento/estado', (req, res) => { // Sub-endpoint
   db.query('UPDATE servicio_audiovisual SET estado=? WHERE id_evento=?', [estado, id_evento], (err, result) => { // Sobrescribe implacablemente con una sola Query a N cantidad multiplicada de sub elementos adosados todos coincidentemente a un mismo Foraneo id_evento
     if (err) { // Manejador basico error
       console.error('Update All Error:', err); // Trace terminal error Node JS Process instance PM2
-      return res.status(500).json({ mensaje: 'Error al actualizar estado general', error: err.message }); // HTTP Stop error database unreachable
+      return res.status(500).json({ mensaje: 'Error al actualizar estado general', error: 'Error interno de la base de datos' }); // HTTP Stop error database unreachable
     }
     res.json({ mensaje: 'Estado audiovisual del evento actualizado con éxito', affectedRows: result.affectedRows }); // Respuesta victoriosa HTTP Front 
     const reqUserId = req.headers['x-usuario-id']; // Puntero Header Autor Humano Culpable/Responsable del Click accionador masivamente transformador
@@ -1002,8 +1111,8 @@ app.post('/solicitar-restablecimiento', (req, res) => { // Endpoint de disparo i
     const expiracion = new Date(Date.now() + 3600000); // 1 hora exacta de validez estricta (Time to live TTL) sumada en formato Milisegundos Epoch a la fecha Actual
 
     db.query( // Asienta transaccionalmente en la Tabla Temporal el hash y su atadura al correo
-      'INSERT INTO restablecimiento_token (correo, token, expiracion) VALUES (?, ?, ?)',
-      [correo, token, expiracion], // Pasa parámetros
+      'INSERT INTO restablecimiento_token (id_usuario, token, expiracion) VALUES (?, ?, ?)',
+      [results[0].id_usuario, token, expiracion], // Pasa parámetros
       (errInsert) => { // Callback
         if (errInsert) return res.status(500).json({ mensaje: 'Error al generar el token' }); // Rechazo por caída de disco
 
@@ -1062,7 +1171,7 @@ app.post('/solicitar-restablecimiento', (req, res) => { // Endpoint de disparo i
 app.get('/validar-token/:token', (req, res) => { // Endpoint auxiliar silencioso de ping pong. Su función es que la Pantalla GUI Reset password se auto-destruya si el token URL caducó o es falso sin requerir botonazo al montar en RAM component
   const { token } = req.params; // Toma segmento Path Dinamico
   db.query( // Lee la tabla sucia temporal de tokens
-    'SELECT correo FROM restablecimiento_token WHERE token = ? AND expiracion > NOW()', // Magia SQL C: Chequea MATCH de string con WHERE y usa función matemática Date de base de datos nativa NOW() para verificar si expiró (Time Travel Logic Validation Engine)
+    'SELECT u.correo FROM restablecimiento_token t JOIN usuario u ON t.id_usuario = u.id_usuario WHERE t.token = ? AND t.expiracion > NOW()', // Magia SQL C: Chequea MATCH de string con WHERE y usa función matemática Date de base de datos nativa NOW() para verificar si expiró (Time Travel Logic Validation Engine)
     [token],
     (err, results) => { // Analiza return array length bool
       if (err) return res.status(500).json({ mensaje: 'Error al validar el token' }); // Manejador basico logico error
@@ -1074,30 +1183,30 @@ app.get('/validar-token/:token', (req, res) => { // Endpoint auxiliar silencioso
   );
 });
 
-app.post('/restablecer-contrasena', (req, res) => { // Endpoint Definitivo Mutador Táctico Finalizador (Post de ejecución destructiva y sobre-escritura)
+app.post('/restablecer-contrasena', async (req, res) => { // Endpoint Definitivo Mutador Táctico Finalizador (Post de ejecución destructiva y sobre-escritura)
   const { token, nuevaContrasena } = req.body; // Requiere la llave token devuelta en payload y el plaintext string password recien digitado
   
   // 1. Re-Validar Estrictamente lado servidor node el token antes de matar contraseña antigua (Evita Bypassing REST calls Postman y Replays)
   db.query(
-    'SELECT correo FROM restablecimiento_token WHERE token = ? AND expiracion > NOW()', // Mismo chequeo de caducidad temporal anti-latencia
+    'SELECT id_usuario FROM restablecimiento_token WHERE token = ? AND expiracion > NOW()', // Mismo chequeo de caducidad temporal anti-latencia
     [token],
-    (err, results) => {
+    async (err, results) => {
       if (err) return res.status(500).json({ mensaje: 'Error al validar el token' }); // Fallo Try Catch like
       if (results.length === 0) { // Timeout confirmacion reaccion tardia usuario o inyeccion delay ataque
         return res.status(400).json({ mensaje: 'Token inválido o expirado' });
       }
 
-      const correo = results[0].correo; // Pinpoint selectivo estricto de la cuenta víctima objetiva a actualizar segun el token
+      const id_usuario = results[0].id_usuario; // Pinpoint selectivo estricto de la cuenta víctima objetiva a actualizar segun el token
 
       // 2. Actualizar contraseña oficial (Idealmente aquí se usaría un Bcrypt Hash gen salt, pero ProEvent iteración Mvp usa Plaintext local en db SQL Base table usuario provisorio por ahora para prueba simple académica de flujo login basico)
       db.query(
-        'UPDATE usuario SET contrasena = ? WHERE correo = ?', // Exec Update query basico relacional root string modify setter
-        [nuevaContrasena, correo],
+        'UPDATE usuario SET contrasena = ? WHERE id_usuario = ?', 
+        [await bcrypt.hash(nuevaContrasena, 10), id_usuario],
         (errUpdate) => {
           if (errUpdate) return res.status(500).json({ mensaje: 'Error al actualizar la contraseña' }); // Fallo MySQL Update query parse
 
           // 3. Destruir e incinerar el token usado para asegurar su condición "Uso Único Desechable Limitado" o (One Time Use - Burn after read single use ticket policy enforcer mechanism destructor)
-          db.query('DELETE FROM restablecimiento_token WHERE correo = ?', [correo], () => { }); // Purga silenciada sin catch back alert trigger
+          db.query('DELETE FROM restablecimiento_token WHERE id_usuario = ?', [id_usuario], () => { }); // Purga silenciada sin catch back alert trigger
 
           res.json({ mensaje: 'Contraseña actualizada con éxito' }); // Respuesta Ok Verde HTTP 200 Exito UI Router App PWA React Redirect logic flag return
         }
@@ -1107,7 +1216,7 @@ app.post('/restablecer-contrasena', (req, res) => { // Endpoint Definitivo Mutad
 });
 
 // ── EVALUACIONES DE CALIDAD EVENTO POST-MORTEM — CREAR ───────────────────────────────
-app.post('/evaluaciones', (req, res) => { // Via POST API graba encuesta final de calidad retroalimentadora del solicitante
+app.post('/evaluaciones', async (req, res) => { // Via POST API graba encuesta final de calidad retroalimentadora del solicitante
   const { id_evento, respuesta_solicitud, recinto, valoracion_respuesta, satisfaccion, comentario } = req.body; // Cosecha respuestas y variables metricas JSON parse destructuradas
   
   // Regla Negocio Fuerte Validatoria de Nulls Protectores (Anti-Blank Form submit prevention)
@@ -1120,12 +1229,24 @@ app.post('/evaluaciones', (req, res) => { // Via POST API graba encuesta final d
     return res.status(400).json({ mensaje: 'El nivel de satisfacción debe estar entre 1 y 5.' }); // Repulsa hacker attacks override API parameter mutation string
   }
 
+  // MAPEO DE RECINTO STRING A ID
+  let id_recinto = null;
+  try {
+    // Intentar buscar exactamente o parcialmente
+    const [recintosDB] = await db.promise().query('SELECT id_recinto FROM recinto WHERE nombre LIKE ?', [`%${recinto}%`]);
+    if (recintosDB.length > 0) id_recinto = recintosDB[0].id_recinto;
+    else id_recinto = 1; // Default fallback to Sede Santiago si no cuadra exactamente
+  } catch (err) {
+    console.error('Error buscando recinto para evaluacion', err);
+    id_recinto = 1; // Fallback
+  }
+
   db.query( // Disparo de acción transaccional de Inserción de Metric Collection data log base
-    `INSERT INTO evaluacion (id_evento, respuesta_solicitud, recinto, valoracion_respuesta, satisfaccion, comentario)
+    `INSERT INTO evaluacion (id_evento, respuesta_solicitud, id_recinto, valoracion_respuesta, satisfaccion, comentario)
      VALUES (?, ?, ?, ?, ?, ?)`, // Transfiere variables paramétricas enmascaradas con placeholders '?' previniendo inyección de consultas SQL 
-    [id_evento, respuesta_solicitud, recinto, valoracion_respuesta, satisfaccion, comentario || null], // Matriz condicional array 
+    [id_evento, respuesta_solicitud, id_recinto, valoracion_respuesta, satisfaccion, comentario || null], // Matriz condicional array 
     (err, result) => { // Node JS lambda Callback
-      if (err) return res.status(500).json({ mensaje: 'Error al registrar la evaluación', error: err.message }); // Fallback control de base de datos error (Fallo en constraint llave foránea si el evento no existe)
+      if (err) return res.status(500).json({ mensaje: 'Error al registrar la evaluación', error: 'Error interno de la base de datos' }); // Fallback control de base de datos error (Fallo en constraint llave foránea si el evento no existe)
       res.status(201).json({ mensaje: 'Evaluación enviada con éxito', id_evaluacion: result.insertId }); // Okey verde HTTP 201 Created Status Devuelve UUID nuevo auto num generado al vuelo en MySQL Server
       const reqUserId = req.headers['x-usuario-id']; // Busca Head Admin ID para historial (Puede ser nulo u opcional dependiendo de quién dispara si es logueado)
       if (reqUserId) registrarMovimiento( // Apunta function call Historial Bitacora Transversal Global
@@ -1148,7 +1269,7 @@ app.get('/evaluaciones', (req, res) => { // Resumen General de encuestas Extraid
      LEFT JOIN evento e ON ev.id_evento = e.id_evento -- Cruza foreign ID number key para leer titulo textual descriptivo de qué evento estamos opinando en forma de texto humano
      ORDER BY ev.fecha DESC`, // Más reciente siempre en el tope LIFO top visual sort engine descendente para que lo nuevo aparezca a simple vista sin scroll
     (err, results) => {
-      if (err) return res.status(500).json({ error: err.message }); // Interrupción destructiva controlada DB Outage Error response JSON obj export down error msg string
+      if (err) return res.status(500).json({ error: 'Error interno de la base de datos' }); // Interrupción destructiva controlada DB Outage Error response JSON obj export down error msg string
       res.json(results); // Exporta Data Frame Result Set completo Array listo para tablas y gráficos dashboard rendering react context
     }
   );
@@ -1159,7 +1280,7 @@ app.get('/evaluaciones', (req, res) => { // Resumen General de encuestas Extraid
 // 1. Equipos Audiovisuales Abm (Alta Baja Modificacion Diccionario)
 app.get('/equipos-audiovisuales', (req, res) => { // Listado API Get route fetch call global index search parameter
   db.query('SELECT * FROM equipo_audiovisual ORDER BY nombre ASC', (err, results) => { // Llama el diccionario total alfanumericamente ordenado natural de letras A-Z ASC Ascending
-    if (err) return res.status(500).json({ error: err.message }); // Handle return res status code http
+    if (err) return res.status(500).json({ error: 'Error interno de la base de datos' }); // Handle return res status code http
     res.json(results); // Export Result Array Collection List elements
   });
 });
@@ -1167,20 +1288,20 @@ app.post('/equipos-audiovisuales', (req, res) => { // Creacion de Item de Catál
   const { nombre, icono, cantidad_total } = req.body; // Objeto data prop input elements req format JSON parse
   if (!nombre) return res.status(400).json({ mensaje: 'Nombre requerido' }); // Condicion 0 validation rules blank logic guard fail bypass trigger
   db.query('INSERT INTO equipo_audiovisual (nombre, icono, cantidad_total) VALUES (?, ?, ?)', [nombre, icono || 'FiMonitor', cantidad_total || 0], (err, result) => { // Instancia fisicamente con iconos feather react default FiMonitor icon fallback default parameter text string array insert in mysql parameter object array value struct
-    if (err) return res.status(500).json({ error: err.message }); // HTTP Exception catcher JSON send out return 
+    if (err) return res.status(500).json({ error: 'Error interno de la base de datos' }); // HTTP Exception catcher JSON send out return 
     res.status(201).json({ mensaje: 'Equipo Creado', id: result.insertId }); // Ok 201 Created Inserted id fetch global parameter object ID assign index
   });
 });
 app.put('/equipos-audiovisuales/:id', (req, res) => { // Edita existencia metadatos update edit modify properties update string metadata name icon icon-pack count de maquinas en diccionario inventario existencias update method parameter query in url express route regex param target
   const { nombre, icono, cantidad_total } = req.body; // Cosechadora req body object param element properties destruct obj js target keys vars constants extract assignment data string array number
   db.query('UPDATE equipo_audiovisual SET nombre=?, icono=?, cantidad_total=? WHERE id_equipo=?', [nombre, icono, cantidad_total || 0, req.params.id], (err) => { // Update estatico param string replacement index target where equals strict math int sql native syntax execute connection string payload transmit variable mapping 
-    if (err) return res.status(500).json({ error: err.message }); // error boundary stop execution logic chain return object json content type text
+    if (err) return res.status(500).json({ error: 'Error interno de la base de datos' }); // error boundary stop execution logic chain return object json content type text
     res.json({ mensaje: 'Equipo Actualizado' }); // Ok 200 return object text 
   });
 });
 app.delete('/equipos-audiovisuales/:id', (req, res) => { // API Backend server Delete Endpoint Router parameter express method destructure
   db.query('DELETE FROM equipo_audiovisual WHERE id_equipo=?', [req.params.id], (err) => { // Desvanece item fisico dictionary delete wipe erase action function database table action native execution run commit delete math 
-    if (err) return res.status(500).json({ error: err.message }); // Falla por FK constraint constraint de evento previo en foreign rules (foreign key constraint error mysql native failure code prevention crash loop block mechanism return code string)
+    if (err) return res.status(500).json({ error: 'Error interno de la base de datos' }); // Falla por FK constraint constraint de evento previo en foreign rules (foreign key constraint error mysql native failure code prevention crash loop block mechanism return code string)
     res.json({ mensaje: 'Equipo Eliminado' }); // Success Result Out JSON body string text response status 200 HTTP API Standard return
   });
 });
@@ -1188,7 +1309,7 @@ app.delete('/equipos-audiovisuales/:id', (req, res) => { // API Backend server D
 // 2. Tipos de Evento Master (Catálogo Estático Funcional)
 app.get('/tipos-evento', (req, res) => { // Endpoint Listar GET
   db.query('SELECT * FROM tipo_evento_master ORDER BY nombre ASC', (err, results) => { // Query Orden Alfabetico 
-    if (err) return res.status(500).json({ error: err.message }); // Escudo Error
+    if (err) return res.status(500).json({ error: 'Error interno de la base de datos' }); // Escudo Error
     res.json(results); // Export Result List JSON array
   });
 });
@@ -1196,19 +1317,19 @@ app.post('/tipos-evento', (req, res) => { // Add new type
   const { nombre } = req.body; // Pide string param input
   if (!nombre) return res.status(400).json({ mensaje: 'Nombre requerido' }); // Bouncer vacio
   db.query('INSERT INTO tipo_evento_master (nombre) VALUES (?)', [nombre], (err, result) => { // Insert Table
-    if (err) return res.status(500).json({ error: err.message });
+    if (err) return res.status(500).json({ error: 'Error interno de la base de datos' });
     res.status(201).json({ mensaje: 'Tipo Creado', id: result.insertId }); // Exito
   });
 });
 app.put('/tipos-evento/:id', (req, res) => { // Modificador Metadata
   db.query('UPDATE tipo_evento_master SET nombre=? WHERE id_tipo_evento=?', [req.body.nombre, req.params.id], (err) => { // Update row
-    if (err) return res.status(500).json({ error: err.message }); // Error throw handler
+    if (err) return res.status(500).json({ error: 'Error interno de la base de datos' }); // Error throw handler
     res.json({ mensaje: 'Tipo Actualizado' }); // Success return message string object JSON HTTP 200
   });
 });
 app.delete('/tipos-evento/:id', (req, res) => { // Borrado duro
   db.query('DELETE FROM tipo_evento_master WHERE id_tipo_evento=?', [req.params.id], (err) => { // Destructor
-    if (err) return res.status(500).json({ error: err.message }); // Bloqueo de Foreign Key Restrict si algun evento viejo usa este tipo master 
+    if (err) return res.status(500).json({ error: 'Error interno de la base de datos' }); // Bloqueo de Foreign Key Restrict si algun evento viejo usa este tipo master 
     res.json({ mensaje: 'Tipo Eliminado' }); // Success 200 OK 
   });
 });
@@ -1216,7 +1337,7 @@ app.delete('/tipos-evento/:id', (req, res) => { // Borrado duro
 // 3. Tipos de Detalle Corporativo (Checkboxes Master list)
 app.get('/tipos-detalle-corporativo', (req, res) => { // Ruta listado GET HTTP Endpoint Node API Router
   db.query('SELECT * FROM tipo_detalle_corporativo ORDER BY nombre ASC', (err, results) => { // Llama datos
-    if (err) return res.status(500).json({ error: err.message }); // Interrumpt catch error
+    if (err) return res.status(500).json({ error: 'Error interno de la base de datos' }); // Interrumpt catch error
     res.json(results); // Array obj dump 
   });
 });
@@ -1224,19 +1345,19 @@ app.post('/tipos-detalle-corporativo', (req, res) => { // Ruta insercion base
   const { nombre } = req.body; // Text param
   if (!nombre) return res.status(400).json({ mensaje: 'Nombre requerido' }); // Regex not null check false bypass prevent
   db.query('INSERT INTO tipo_detalle_corporativo (nombre) VALUES (?)', [nombre], (err, result) => { // SQL Ejecucion
-    if (err) return res.status(500).json({ error: err.message }); // Caida DB MySQL Log error string parse
+    if (err) return res.status(500).json({ error: 'Error interno de la base de datos' }); // Caida DB MySQL Log error string parse
     res.status(201).json({ mensaje: 'Detalle Creado', id: result.insertId }); // Send Object Response
   });
 });
 app.put('/tipos-detalle-corporativo/:id', (req, res) => { // Alter param row 
   db.query('UPDATE tipo_detalle_corporativo SET nombre=? WHERE id_detalle_corp=?', [req.body.nombre, req.params.id], (err) => { // Update Setter target mapping match
-    if (err) return res.status(500).json({ error: err.message }); // Error
+    if (err) return res.status(500).json({ error: 'Error interno de la base de datos' }); // Error
     res.json({ mensaje: 'Detalle Actualizado' }); // Return UI msg string
   });
 });
 app.delete('/tipos-detalle-corporativo/:id', (req, res) => { // Destruction Drop delete node row
   db.query('DELETE FROM tipo_detalle_corporativo WHERE id_detalle_corp=?', [req.params.id], (err) => { // Purga 
-    if (err) return res.status(500).json({ error: err.message }); // SQL Restrict prevent crash log text error code mysql backend query
+    if (err) return res.status(500).json({ error: 'Error interno de la base de datos' }); // SQL Restrict prevent crash log text error code mysql backend query
     res.json({ mensaje: 'Detalle Eliminado' }); // Send
   });
 });
@@ -1244,7 +1365,7 @@ app.delete('/tipos-detalle-corporativo/:id', (req, res) => { // Destruction Drop
 // 4. Alimentos (Catering Master Dictionary Base)
 app.get('/alimentos', (req, res) => { // API List Data GET Fetch Call URL Point Route Express Middleware
   db.query('SELECT * FROM alimento ORDER BY nombre ASC', (err, results) => { // SQL Sort Read array from physical drive Table Base DB Connector Connection Thread Pool Loop Callback lambda
-    if (err) return res.status(500).json({ error: err.message }); // Exception 
+    if (err) return res.status(500).json({ error: 'Error interno de la base de datos' }); // Exception 
     res.json(results); // Serializer Output
   });
 });
@@ -1252,19 +1373,19 @@ app.post('/alimentos', (req, res) => { // Añade Elemento
   const { nombre } = req.body; // Pide Data 
   if (!nombre) return res.status(400).json({ mensaje: 'Nombre requerido' }); // Filtra vacios null string undefined 
   db.query('INSERT INTO alimento (nombre) VALUES (?)', [nombre], (err, result) => { // Dispara Query
-    if (err) return res.status(500).json({ error: err.message }); // Throw log node app error
+    if (err) return res.status(500).json({ error: 'Error interno de la base de datos' }); // Throw log node app error
     res.status(201).json({ mensaje: 'Alimento Creado', id: result.insertId }); // Good path
   });
 });
 app.put('/alimentos/:id', (req, res) => { // Edita String texto Metadata 
   db.query('UPDATE alimento SET nombre=? WHERE id_alimento=?', [req.body.nombre, req.params.id], (err) => { // Modifica
-    if (err) return res.status(500).json({ error: err.message }); // Handler log text response function 
+    if (err) return res.status(500).json({ error: 'Error interno de la base de datos' }); // Handler log text response function 
     res.json({ mensaje: 'Alimento Actualizado' }); // Send back ok status code 200 normal text string object 
   });
 });
 app.delete('/alimentos/:id', (req, res) => { // Remueve Item fisico de sistema global
   db.query('DELETE FROM alimento WHERE id_alimento=?', [req.params.id], (err) => { // Delete action execute query commit MySQL Storage Engine trigger match target ID PK Primary key filter search row delete math function log transaction node router
-    if (err) return res.status(500).json({ error: err.message }); // Evita colapso si un Evento historico ya lo seleccionó previamente y tiene FK Lock table rules constraint trigger abort 
+    if (err) return res.status(500).json({ error: 'Error interno de la base de datos' }); // Evita colapso si un Evento historico ya lo seleccionó previamente y tiene FK Lock table rules constraint trigger abort 
     res.json({ mensaje: 'Alimento Eliminado' }); // Terminado HTTP End response write socket close output message
   });
 });
