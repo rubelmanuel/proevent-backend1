@@ -18,7 +18,7 @@ const googleClient = new OAuth2Client(GOOGLE_CLIENT_ID); // Inicializa el client
 // --- CONFIGURACIÓN DEL SERVIDOR EXPRESS ---
 const app = express(); // Instancia un nuevo servidor Express
 app.use(helmet()); // Seguridad HTTP
-app.use(cors({ origin: 'http://localhost:3000' })); // Restringir CORS al frontend local // Se añade el middleware global CORS a todas las rutas
+app.use(cors({ origin: 'http://localhost:3001' })); // Restringir CORS al frontend local // Se añade el middleware global CORS a todas las rutas
 app.use(express.json());
 
 const limiter = rateLimit({
@@ -93,23 +93,43 @@ db.getConnection((err, connection) => {
 // Función reutilizable (Helper): Registra una acción administrativa o del sistema en la base de datos auditable (Bitácora)
 function registrarMovimiento(id_usuario, id_rol, accion, detalles = '') {
   if (!id_usuario) return; // Validación de seguridad: no puede registrarse nada sin un responsable directo asociado (id_usuario)
-  
+
   // Sub-función interna (Closure) que realiza la inserción física real en la base de datos
   const registrar = (id_usr, id_rl) => {
-    // Sentencia SQL insertando el log de forma parametrizada explícita (usando signaturas '?' para prevenir ataques de inyección SQL)
     const sql = 'INSERT INTO bitacora_movimiento (id_usuario, id_rol, accion, detalles) VALUES (?, ?, ?, ?)';
     db.query(sql, [id_usr, id_rl, accion, detalles], (err) => {
-      // Manejo silencioso de errores para garantizar que si falla la bitácora, NO derribe la petición en curso del usuario
-      if (err) console.error('Error registrando bitácora:', err); 
+      if (err) console.error('Error registrando bitácora:', err);
     });
   };
 
-  if (!id_rol) { // Si la función padre fue llamada sin proveer un ID de rol, el sistema asume hacer una consulta extra para encontrarlo
+  // Helper to resolve role identifier when provided as a name string
+  const resolveRolId = (rolName, callback) => {
+    db.query('SELECT id_rol FROM rol WHERE nombre = ?', [rolName], (err, res) => {
+      if (err) {
+        console.error('Error resolviendo id_rol desde nombre:', err);
+        callback(null);
+      } else if (res.length > 0) {
+        callback(res[0].id_rol);
+      } else {
+        console.error('Rol no encontrado para nombre:', rolName);
+        callback(null);
+      }
+    });
+  };
+
+  if (!id_rol) {
+    // Si no se provee id_rol, buscarlo a partir del usuario
     db.query('SELECT id_rol FROM usuario WHERE id_usuario = ?', [id_usuario], (err, res) => {
-      if (!err && res.length > 0) registrar(id_usuario, res[0].id_rol); // Una vez obtenido de la base de datos, ejecuta el insert interno asincrónico
+      if (!err && res.length > 0) registrar(id_usuario, res[0].id_rol);
+    });
+  } else if (typeof id_rol === 'string' && isNaN(Number(id_rol))) {
+    // Si id_rol es un nombre de rol, resolverlo a su id numérico
+    resolveRolId(id_rol, (resolvedId) => {
+      if (resolvedId) registrar(id_usuario, resolvedId);
     });
   } else {
-    registrar(id_usuario, id_rol); // Si la información requerida ya estaba provista plenamente, la registra de manera inmediata y sincrónica
+    // Caso normal donde ya se tiene el id numérico
+    registrar(id_usuario, id_rol);
   }
 }
 
